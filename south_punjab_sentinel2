@@ -1,0 +1,520 @@
+// JavaScript code to be implemented in Google Earth Engine(c) developed by H.A. Orengo
+// to accompany the paper:
+
+// Orengo, H.A. and Petrie, C.A. 2017. Large-scale, multi-temporal remote sensing of
+// palaeo-river networks: a case study from northwest India and its implications for
+// the Indus Civilisation. Remote Sensing, 9(7): 735; doi: 10.3390/rs9070735
+
+//The following is a modification of the original code to accompany the paper: 
+//Garcia-Molsosa, A. Orengo H.A. Petrie C.A. 'Reconstructing long-term settlement histories on complex 
+//alluvial floodplains: integrating historical map analysis and remote-sensing in the 
+//archaeological analysis of the landscape of the Indus River Basin'
+
+//                ------------- ooo -------------
+
+// TO EXECUTE THESE SCRIPTS PASTE THIS CODE INTO GOOGLE EARTH ENGINE CODE EDITOR AND PRESS RUN
+
+//                ------------- ooo -------------
+
+// The different algorithms are written here following the order adopted in the journal article:
+// 1. NDVSI (Normalised Difference Vegetation Seasonality Index), line 100
+// 2. SMTVI (Seasonal Multi-Temporal Vegetation Indices),         line 150
+// 3. Wet Months Multi-Temporal Tasselled Cap Transformation,     line 198
+// 4. Dry Months Multi-Temporal Tasselled Cap Transformation,     line 257
+// 5. Wet Months Multi-Temporal Principal Component Analysis,     line 308
+// 6. Dry Months Multi-Temporal Principal Component Analysis,     line 413
+
+// For more information on how these scripts work and how to apply them refer to the text of the 
+// article, which is freely available at: http://www.mdpi.com/2072-4292/9/7/735
+// Suggestions and code improvementents are welcome! Please, contact Hector A. Orengo
+
+// NOTES, READ CAREFULLY!
+// 1. Visualisation parameters for each layer can be adjusted in the Layers dialogue in the map
+//    area of Goggle Earth Engine. This might be convenient when visualising at different scales.
+// 2. To apply these analyses in other areas simply change the 'geometry' variable and the
+//    'Map.setCenter' coordinates. These two parameters can be deleted. Doing so will apply the
+//    algorithms in whatever area is being displayed in the Google Earth Engine's Map area.
+//    However, if the geometry variable is eliminated it will need to be also deleted from the
+//    scripts incorporating it (for example when it is employed to clip the analysis area).
+//    The user can also draw his/her own polygon using the tool provided in the top left of Google
+//    Earth Engine’s map window. This will create a polygon named ‘geometry’ by default. The user
+//    can then delete the variable called ‘geometry’ in the code lines 52-65 and the analysis will
+//    be performed in the newly defined area. Make sure the central coordinates defined by
+//    'Map.setCenter' (lines 67-69) are also changed so the map window will zoom to these
+//    coordinates when executing the scripts. 
+// 3. The execution of the algorithms can take some time (particularly the PCAs). To shorten their
+//    visualisation, select only those you require in the layers panel of the Map window.
+// 4. The images resulting from these scripts can be transferred to your Google Drive running the
+//    analysis from the 'task' tab on the top right of the screen.
+// 5. All these algorithms can be run separately, however, there are variables employed by several
+//    of those that only appear the first time that they are required and are not repeated in
+//    subsequent algorithms. The reader is advised to check carefully which variables are employed
+//    by each algorithm and to what part of the code they refer before attempting to run a single
+//    algorithm separately from the rest of the code written here.
+
+
+//                ------------- ooo -------------
+
+// Define your AOI as a polygon with a set of WGS84 coordinates
+var geometry = ee.Geometry.Polygon(
+        [[[77.0129241599144, 29.126283576396666],
+          [76.99688407719941, 34.51770869503887],
+          [70.26828985591624, 34.449720564784535],
+          [70.2462304877987, 29.116648190296782]]]);
+
+// Define a central point in your study area (as X,Y WGS84 decimal degrees) and a scale,
+// just for visualisation purposes
+Map.setCenter(72.86335,30.63028,8);
+
+//Obtain Sentinel 2 collection
+var s2 = ee.ImageCollection('COPERNICUS/S2');
+
+// This section uses the Sentinel-2 QA band to cloud mask
+// the collection.  The Sentinel-2 cloud flags are less
+// selective, so the collection is also pre-filtered by the
+// CLOUDY_PIXEL_PERCENTAGE flag, to use only relatively
+// cloud-free granule.
+
+// Function to mask clouds using the Sentinel-2 QA band.
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  // Return the masked and scaled data, without the QA bands.
+  return image.updateMask(mask).divide(10000)
+      .select("B.*")
+      .copyProperties(image, ["system:time_start"]);
+}
+
+//Map the function over the selected period of time and take the median. 
+//Note that Sentinel 2 is an ongoing mission and the dates can be updated to use all the data available.
+// Load Sentinel-2 TOA reflectance data.
+var collection = ee.ImageCollection('COPERNICUS/S2')
+    .filterDate('2015-06-23', '2022-12-01')
+    // Pre-filter to get less cloudy granules.
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(maskS2clouds);
+
+
+//                ------------- ooo -------------
+
+
+// NDVSI (Normalised Difference Vegetation Seasonality Index)
+
+//Load the Sentinel2 collection (dates defined in the previous section
+//and select the bands of interest: B4 (red) and B8 (NIR)
+var S2_NDVSI = collection.select(['B4', 'B8']);
+
+// Select the Sentinel2 images corresponding to the wet months and average their values
+var wet1 = S2_NDVSI.filter(ee.Filter.dayOfYear(1,120))
+    .mean();
+var wet2 = S2_NDVSI.filter(ee.Filter.dayOfYear(181,240))
+    .mean();
+var wet = (wet1.add(wet2)).divide(2);
+
+// Develop a simple vegetation ratio for the wet months
+var dvi_wet = wet.expression(
+    'b("B8") / (b("B8") + b("B4"))');
+
+// Select the Sentinel2 images corresponding to the dry months and average their values
+var dry1 = S2_NDVSI.filter(ee.Filter.dayOfYear(121,180))
+    .mean();
+var dry2 = S2_NDVSI.filter(ee.Filter.dayOfYear(241,360))
+    .mean();
+var dry = (dry1.add(dry2)).divide(2);
+
+// Develop a simple vegetation ratio for the dry months
+var dvi_dry = dry.expression(
+    'b("B8") / (b("B8") + b("B4"))');
+
+// Develop the NDVSI and clip it using the AOI
+var ndvsi = ((dvi_dry.subtract(dvi_wet)))
+    .divide((dvi_dry.add(dvi_wet)))
+    .clip(geometry);
+
+var ndvsi_palette =
+    '011301, 011d01, 012e01, 023b01, 004c00, 056201, 207401, 3e8601, 529400,' +
+    '66a000, 74a901, 99b718, fcd163, f1b555, df923d, ce7e45, 9d350e';
+
+Map.addLayer(ndvsi, {min: -0.0705, max: 0.00408, palette: ndvsi_palette}, 'NDVSI');
+
+Export.image.toDrive({
+  image: ndvsi,
+  description: 'NDVSI_s2',
+  scale: 10,
+  maxPixels: 1e9,
+  region: geometry
+});
+
+
+//                ------------- ooo -------------
+
+
+// SMTVI (Seasonal Multi-Temporal Vegetation Indices)
+
+
+// Filter them by two-months periods and extract the average values 
+var S2_JanFeb = collection.filter(ee.Filter.dayOfYear(1,60))
+    .mean()
+    .normalizedDifference(['B8','B4']);
+var S2_MarApr = collection.filter(ee.Filter.dayOfYear(61,120))
+    .mean()
+    .normalizedDifference(['B8','B4']);
+var S2_MayJun = collection.filter(ee.Filter.dayOfYear(121,180))
+    .mean()
+    .normalizedDifference(['B8','B4']);
+var S2_JulAug = collection.filter(ee.Filter.dayOfYear(181,240))
+    .mean()
+    .normalizedDifference(['B8','B4']);
+var S2_SepOct = collection.filter(ee.Filter.dayOfYear(241,300))
+    .mean()
+    .normalizedDifference(['B8','B4']);
+var S2_NovDec = collection.filter(ee.Filter.dayOfYear(301,360))
+    .mean()
+    .normalizedDifference(['B8','B4']);
+
+// Create a composite image with all the two-month average EVI composites and clip the area of analysis
+// according to your AOI (the AOI is defined by the geometry variable, which can be created/modified using
+// the map window below)
+var composite = ee.Image([S2_JanFeb, S2_MarApr, S2_MayJun, S2_JulAug, S2_SepOct, S2_NovDec])
+    .clip(geometry);
+    
+// Rename the composite bands so they can be easier to interpret
+var SMTVI = composite.select(
+    ['nd', 'nd_1', 'nd_2', 'nd_3', 'nd_4', 'nd_5'], // old names
+    ['S2_JanFeb', 'S2_MarApr', 'S2_MayJun', 'S2_JulAug', 'S2_SepOct', 'S2_NovDec'] // new names
+);
+
+// Add the newly created layer to the map window. In this case we have created a RGB composite joining
+// the bi-month EVI average values from July-August (R), March-April (G) and January-February (B) 
+Map.addLayer(SMTVI, {bands: ["S2_JulAug","S2_MarApr","S2_JanFeb"], min: 0.12340243216502006, max: 0.5330676407686823}, 'SMTVI');
+
+// Export the SMTVI image (with all bi-month EVI averages) to your Google drive
+Export.image.toDrive({
+  image: SMTVI,
+  description: 'SMTVI_s2',
+  scale: 10,
+  maxPixels: 1e9,
+  region: geometry
+});
+
+
+//                ------------- ooo -------------
+
+
+// Wet Months Multi-Temporal Tasselled Cap Transformation
+
+// Define an Array of Tasselled Cap coefficients (Nedkov, R. (2017). Orthogonal Transformation of Segmented Images from the Satellite Sentinel-2. Comptes Rendus de l’Académie Bulgare Des Sciences: Sciences Mathématiques et Naturelles, 70(5), 9.)
+var coefficients = ee.Array([
+  [0.0356, 0.0822, 0.1360, 0.2611, 0.2964, 0.3338, 0.3877, 0.3895, 0.0949, 0.0009, 0.3882, 0.1366, 0.4750],
+  [-0.0635, -0.1128, -0.1680, -0.3480, -0.3303, 0.0852, 0.3302, 0.3165, 0.0467, -0.0009, -0.4578, -0.4064, 0.3625],
+  [0.0649, 0.1363, 0.2802, 0.3072, 0.5288, 0.1379, -0.0001, -0.0807, -0.0302, 0.0003, -0.4064, -0.5602, -0.1389],
+]);
+
+// Load Sentinel2 collection (dates defined in line 100) and select the bands of interest
+var s2_bands = collection.select(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12', 'B8A']);
+
+// Select the Sentinel2 images corresponding to the wet months, average their values and clip to AOI 
+var s2_bands_Wet1 = s2_bands.filter(ee.Filter.dayOfYear(1,120))
+    .mean();
+var s2_bands_Wet2 = s2_bands.filter(ee.Filter.dayOfYear(181,240))
+    .mean();
+var s2_bands_Wet = (s2_bands_Wet1.add(s2_bands_Wet2)).divide(2)
+    .clip(geometry);
+
+// Make an Array Image, with a 1-D Array per pixel.
+var arrayImage1D_Wet = s2_bands_Wet.toArray();
+
+// Make an Array Image with a 2-D Array per pixel, 6x1.
+var arrayImage2D_Wet = arrayImage1D_Wet.toArray(1);
+
+// Do a matrix multiplication: 6x6 times 6x1.
+var TCT_s2_Wet = ee.Image(coefficients)
+  .matrixMultiply(arrayImage2D_Wet)
+  // Get rid of the extra dimensions.
+  .arrayProject([0])
+  .arrayFlatten(
+    [['brightness', 'greenness', 'wetness']]);
+
+// Display the first three bands of the result and the input imagery.
+var vizTCTwet = {
+  bands: ['brightness', 'greenness', 'wetness'],
+  min: [0.409257, -0.214159, -0.0612963], max: [0.832236, 0.0478121, 0.0211257]
+};
+
+// Add the resulting layer
+Map.addLayer(TCT_s2_Wet, vizTCTwet, 'TCT_s2_Wet');
+
+// Export the Multitemporal TCT of the wet months to your Google Drive
+Export.image.toDrive({
+  image: TCT_s2_Wet,
+  description: 'TCT_s2_Wet',
+  scale: 10,
+  maxPixels: 1e9,
+  region: geometry
+});
+
+
+//                ------------- ooo -------------
+
+
+// Dry Months Multi-Temporal Tasselled Cap Transformation
+
+// NOTES!
+// 1. The Array of Tasselled Cap coefficients has already been defined in the previous section
+// 2. The bands of interest from the Sentinel2 collection have already been selected in the
+//    previous section
+
+// Select the Sentinel2 images corresponding to the dry months, average their values and clip to AOI
+var s2_bands_Dry1 = s2_bands.filter(ee.Filter.dayOfYear(121,180))
+    .mean();
+var s2_bands_Dry2 = s2_bands.filter(ee.Filter.dayOfYear(241,360))
+    .mean();
+var s2_bands_Dry = (s2_bands_Dry1.add(s2_bands_Dry2)).divide(2)
+    .clip(geometry);
+
+// Make an Array Image, with a 1-D Array per pixel.
+var arrayImage1D_Dry = s2_bands_Dry.toArray();
+
+// Make an Array Image with a 2-D Array per pixel, 6x1.
+var arrayImage2D_Dry = arrayImage1D_Dry.toArray(1);
+
+// Do a matrix multiplication: 6x6 times 6x1.
+var TCT_s2_Dry = ee.Image(coefficients)
+  .matrixMultiply(arrayImage2D_Dry)
+  // Get rid of the extra dimensions.
+  .arrayProject([0])
+  .arrayFlatten(
+    [['brightness', 'greenness', 'wetness']]);
+
+// Display the first three bands of the result and the input imagery.
+var vizTCTdry = {
+  bands: ['brightness', 'greenness', 'wetness'],
+  min: [0.409257, -0.214159, -0.0612963], max: [0.832236, 0.0478121, 0.0211257]
+};
+
+// Add the resulting layer
+Map.addLayer(TCT_s2_Dry, vizTCTdry, 'TCT_s2_Dry');
+
+// Export the Multitemporal TCT of the dry months to your Google Drive
+Export.image.toDrive({
+  image: TCT_s2_Dry,
+  description: 'TCT_s2_Dry',
+  scale: 10,
+  maxPixels: 1e9,
+  region: geometry
+});
+
+
+//                ------------- ooo -------------
+
+
+// Wet Months Multi-Temporal Principal Component Analysis
+
+// NOTES!
+// 1. The bands of interest from the Landsat 5 collection have already been selected in the
+//    previous section
+// 2. The filter of seasonal images has already been done in previous sections
+
+
+// Get some information about the input to be used later.
+var scale = s2_bands_Wet.projection().nominalScale();
+var bandNames = s2_bands_Wet.bandNames();
+
+// Mean center the data to enable a faster covariance reducer
+// and an SD stretch of the principal components.
+var meanDict = s2_bands_Wet.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geometry,
+    scale: scale,
+    maxPixels: 1e9
+});
+var means = ee.Image.constant(meanDict.values(bandNames));
+var centered = s2_bands_Wet.subtract(means);
+
+// This helper function returns a list of new band names.
+var getNewBandNames = function(prefix) {
+  var seq = ee.List.sequence(1, bandNames.length());
+  return seq.map(function(b) {
+    return ee.String(prefix).cat(ee.Number(b).int());
+  });
+};
+
+// This function accepts mean centered imagery, a scale and
+// a region in which to perform the analysis.  It returns the
+// Principal Components (PC) in the region as a new image.
+var getPrincipalComponents = function(centered, scale, geometry) {
+  // Collapse the bands of the image into a 1D array per pixel.
+  var arrays = centered.toArray();
+
+  // Compute the covariance of the bands within the region.
+  var covar = arrays.reduceRegion({
+    reducer: ee.Reducer.centeredCovariance(),
+    geometry: geometry,
+    scale: scale,
+    maxPixels: 1e9
+  });
+
+  // Get the 'array' covariance result and cast to an array.
+  // This represents the band-to-band covariance within the region.
+  var covarArray = ee.Array(covar.get('array'));
+
+  // Perform an eigen analysis and slice apart the values and vectors.
+  var eigens = covarArray.eigen();
+
+  // This is a P-length vector of Eigenvalues.
+  var eigenValues = eigens.slice(1, 0, 1);
+  // This is a PxP matrix with eigenvectors in rows.
+  var eigenVectors = eigens.slice(1, 1);
+
+  // Convert the array image to 2D arrays for matrix computations.
+  var arrayImage = arrays.toArray(1);
+
+  // Left multiply the image array by the matrix of eigenvectors.
+  var principalComponents = ee.Image(eigenVectors).matrixMultiply(arrayImage);
+
+  // Turn the square roots of the Eigenvalues into a P-band image.
+  var sdImage = ee.Image(eigenValues.sqrt())
+    .arrayProject([0]).arrayFlatten([getNewBandNames('sd')]);
+
+  // Turn the PCs into a P-band image, normalized by SD.
+  return principalComponents
+    // Throw out an an unneeded dimension, [[]] -> [].
+    .arrayProject([0])
+    // Make the one band array image a multi-band image, [] -> image.
+    .arrayFlatten([getNewBandNames('pc')])
+    // Normalize the PCs by their SDs.
+    .divide(sdImage);
+};
+
+// Get the PCs at the specified scale and in the specified region
+var pcas2wet = getPrincipalComponents(centered, scale, geometry);
+
+//Define the visualisation parameters
+var vizPCAwet = {
+  bands: ['pc2', 'pc4', 'pc1'],
+  min: [-3.2339], max: [3.2845]
+};
+
+// Display a composite with PCs 2,4,1 for visualisation
+// Please change the visualization paramenters to combine different bands
+// and/or reproduce the band combinations of the paper's figures
+// NOTE! The exported image incorporates all Principal Components
+Map.addLayer(pcas2wet, vizPCAwet, 'PCA_composite_(2,4,1)_Wet');
+
+Export.image.toDrive({
+  image: pcas2wet,
+  description: 'PCA_s2_Wet',
+  scale: 10,
+  maxPixels: 1e9,
+  region: geometry
+});
+
+
+//                ------------- ooo -------------
+
+
+// Dry Months Multi-Temporal Principal Component Analysis
+
+// NOTES!
+// 1. The bands of interest from the Sentinel2 collection have already been selected in the
+//    previous section
+// 2. The filter of seasonal images has already been done in previous sections
+// 3. region, scale, and bandNames variables have already been created in the previous section
+
+
+// Mean center the data to enable a faster covariance reducer
+// and an SD stretch of the principal components.
+var meanDict_Dry = s2_bands_Dry.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: geometry,
+    scale: scale,
+    maxPixels: 1e9
+});
+var means_Dry = ee.Image.constant(meanDict_Dry.values(bandNames));
+var centered_Dry = s2_bands_Dry.subtract(means_Dry);
+
+// This helper function returns a list of new band names.
+var getNewBandNames_Dry = function(prefix) {
+  var seq_Dry = ee.List.sequence(1, bandNames.length());
+  return seq_Dry.map(function(b) {
+    return ee.String(prefix).cat(ee.Number(b).int());
+  });
+};
+
+// This function accepts mean centered imagery, a scale and
+// a region in which to perform the analysis.  It returns the
+// Principal Components (PC) in the region as a new image.
+var getPrincipalComponents_Dry = function(centered_Dry, scale, geometry) {
+  // Collapse the bands of the image into a 1D array per pixel.
+  var arrays_Dry = centered_Dry.toArray();
+
+  // Compute the covariance of the bands within the region.
+  var covar_Dry = arrays_Dry.reduceRegion({
+    reducer: ee.Reducer.centeredCovariance(),
+    geometry: geometry,
+    scale: scale,
+    maxPixels: 1e9
+  });
+
+  // Get the 'array' covariance result and cast to an array.
+  // This represents the band-to-band covariance within the region.
+  var covarArray_Dry = ee.Array(covar_Dry.get('array'));
+
+  // Perform an eigen analysis and slice apart the values and vectors.
+  var eigens_Dry = covarArray_Dry.eigen();
+
+  // This is a P-length vector of Eigenvalues.
+  var eigenValues_Dry = eigens_Dry.slice(1, 0, 1);
+  // This is a PxP matrix with eigenvectors in rows.
+  var eigenVectors_Dry = eigens_Dry.slice(1, 1);
+
+  // Convert the array image to 2D arrays for matrix computations.
+  var arrayImage_Dry = arrays_Dry.toArray(1);
+
+  // Left multiply the image array by the matrix of eigenvectors.
+  var principalComponents_Dry = ee.Image(eigenVectors_Dry).matrixMultiply(arrayImage_Dry);
+
+  // Turn the square roots of the Eigenvalues into a P-band image.
+  var sdImage_Dry = ee.Image(eigenValues_Dry.sqrt())
+    .arrayProject([0]).arrayFlatten([getNewBandNames_Dry('sd')]);
+
+  // Turn the PCs into a P-band image, normalized by SD.
+  return principalComponents_Dry
+    // Throw out an an unneeded dimension, [[]] -> [].
+    .arrayProject([0])
+    // Make the one band array image a multi-band image, [] -> image.
+    .arrayFlatten([getNewBandNames_Dry('pc')])
+    // Normalize the PCs by their SDs.
+    .divide(sdImage_Dry);
+};
+
+// Get the PCs at the specified scale and in the specified region
+var pcas2dry = getPrincipalComponents_Dry(centered_Dry, scale, geometry);
+
+//Define the visualisation parameters
+var vizPCAdry = {
+  bands: ['pc2', 'pc4', 'pc1'],
+  min: [-3.2339], max: [3.2845]
+};
+
+// Display a composite with PCs 2,4,1 for visualisation
+// Please change the visualization paramenters to combine different bands
+// and/or reproduce the band combinations of the paper's figures
+// NOTE! The exported image incorporates all Principal Components
+Map.addLayer(pcas2dry, vizPCAdry, 'PCA_composite_(2,4,1)_Dry');
+
+Export.image.toDrive({
+  image: pcas2dry,
+  description: 'PCA_s2_Dry',
+  scale: 10,
+  maxPixels: 1e9,
+  region: geometry
+});
